@@ -1,0 +1,253 @@
+/* 
+ * udpserver.c - A simple UDP echo server 
+ * usage: udpserver <port>
+ */
+
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <netdb.h>
+#include <sys/types.h> 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <dirent.h>
+
+#define BUFSIZE 1024
+
+/*
+ * error - wrapper for perror
+ */
+void error(char *msg) {
+  perror(msg);
+  exit(1);
+}
+
+int main(int argc, char **argv) {
+  int sockfd; /* socket */
+  int portno; /* port to listen on */
+  int clientlen; /* byte size of client's address */
+  struct sockaddr_in serveraddr; /* server's addr */
+  struct sockaddr_in clientaddr; /* client addr */
+  struct hostent *hostp; /* client host info */
+  char buf[BUFSIZE]; /* message buf */
+  char uinput[BUFSIZE]; // buffer for user input
+  char file[BUFSIZE]; // buffer for filename
+  char creply[BUFSIZE]; // buffer for client reply
+  char *hostaddrp; /* dotted decimal host addr string */
+  int optval; /* flag value for setsockopt */
+  int n; /* message byte size */
+  FILE* fileptr = NULL;
+
+  /* 
+   * check command line arguments 
+   */
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s <port>\n", argv[0]);
+    exit(1);
+  }
+  portno = atoi(argv[1]);
+  // Bounds check the port number
+  if (portno <= 5000 || portno >= 65535){
+      error("ERROR port number must be in range 5001-65534");
+  }
+
+  /* 
+   * socket: create the parent socket 
+   */
+  sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sockfd < 0) 
+    error("ERROR opening socket");
+
+  /* setsockopt: Handy debugging trick that lets 
+   * us rerun the server immediately after we kill it; 
+   * otherwise we have to wait about 20 secs. 
+   * Eliminates "ERROR on binding: Address already in use" error. 
+   */
+  optval = 1;
+  setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, 
+	     (const void *)&optval , sizeof(int));
+
+  /*
+   * build the server's Internet address
+   */
+  bzero((char *) &serveraddr, sizeof(serveraddr));
+  serveraddr.sin_family = AF_INET;
+  serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);
+  serveraddr.sin_port = htons((unsigned short)portno);
+
+  /* 
+   * bind: associate the parent socket with a port 
+   */
+  if (bind(sockfd, (struct sockaddr *) &serveraddr, 
+	   sizeof(serveraddr)) < 0) 
+    error("ERROR on binding");
+
+  /* 
+   * main loop: wait for a datagram, then echo it
+   */
+  clientlen = sizeof(clientaddr);
+  while (1) {
+    /*
+     * recvfrom: receive a UDP datagram from a client
+     */
+    bzero(buf, BUFSIZE);
+    n = recvfrom(sockfd, buf, BUFSIZE, 0, (struct sockaddr *) &clientaddr, &clientlen);
+    if (n < 0)
+      error("ERROR in recvfrom");
+
+    /* 
+     * gethostbyaddr: determine who sent the datagram
+     */
+    hostp = gethostbyaddr((const char *)&clientaddr.sin_addr.s_addr, 
+			  sizeof(clientaddr.sin_addr.s_addr), AF_INET);
+    if (hostp == NULL)
+      error("ERROR on gethostbyaddr");
+    hostaddrp = inet_ntoa(clientaddr.sin_addr);
+    if (hostaddrp == NULL)
+      error("ERROR on inet_ntoa\n");
+    printf("server received datagram from %s (%s)\n", 
+	   hostp->h_name, hostaddrp);
+    printf("server received %d/%d bytes: %s\n", strlen(buf), n, buf);
+    
+    // Parse input
+    sscanf(buf, "%s %s", uinput, file);
+    // get [file_name] - The server transmits the requested file to the client
+    if (!strncmp(uinput, "get", 3)) {
+      // prepare the buffer to be filled
+      bzero(buf, BUFSIZE);
+      // check if file exists
+      if (access(file, F_OK ) == -1 ) {
+        printf("ERR The requested file, %s, not found by server\n", file);
+        sprintf(buf, "ERR");
+        n = sendto(sockfd, buf, strlen(buf), 0, (struct sockaddr *) &clientaddr, clientlen);
+        if (n < 0) {
+          error("ERROR in sendto");
+        }
+      }
+      else {
+        FILE* fileptr = fopen(file, "rb");
+        printf("Sending %s to client\n", file);
+        // send file in BUFSIZE chunks
+        while (fread(buf, 1, BUFSIZE, fileptr)) {
+          n = sendto(sockfd, buf, strlen(buf), 0, (struct sockaddr *) &clientaddr, clientlen);
+          if (n < 0) {
+            error("ERROR in sendto");
+          }
+          bzero(buf, BUFSIZE);
+        }
+        // Send END packet signaling the server can stop listening
+        sprintf(buf, "END");
+        n = sendto(sockfd, buf, strlen(buf), 0, (struct sockaddr *) &clientaddr, clientlen);
+        if (n < 0) {
+          error("ERROR in sendto");
+        }
+        // Clean up
+        bzero(buf, BUFSIZE);
+        fclose(fileptr);
+      }
+    }
+    // put [file_name] - The server receives the transmitted file by the client and stores it locally
+    else if (!strncmp(uinput, "put", 3)) {
+      printf("Getting %s from client\n", file);
+      if (n < 0) {
+        error("ERROR in 1st sendto");
+      }
+      while (1) {
+        // Loop waiting for packets from the client 
+        bzero(buf, BUFSIZE);
+        n = recvfrom(sockfd, buf, BUFSIZE, 0, (struct sockaddr *) &clientaddr, &clientlen);
+        if (n < 0)
+          error("ERROR in recvfrom");
+        sscanf(buf, "%s", creply);
+        // END packet signals server can stop looping
+        if (!strncmp(creply, "END", 3)) {
+            printf("Fully received %s from client\n", file);
+            fclose(fileptr);
+            break;
+        }
+        // Write packet to the file
+        else {
+            fileptr = fopen(file, "wb");
+            if(fileptr == NULL){
+                error("Error opening file for writing");
+                break;
+            }
+            fwrite(buf, 1, BUFSIZE, fileptr);
+        }
+      }
+    }
+    // delete [file_name] - The server delete file if it exists. Otherwise do nothing
+    else if (!strncmp(uinput, "delete", 6)) {
+      // prepare the buffer to be filled
+      bzero(buf, BUFSIZE);
+      // check if file exists
+      if (access(file, F_OK ) == -1 ) {
+        printf("ERR The requested file, %s, not found by server\n", file);
+        sprintf(buf, "ERR");
+        n = sendto(sockfd, buf, strlen(buf), 0, (struct sockaddr *) &clientaddr, clientlen);
+        if (n < 0) {
+          error("ERROR in sendto");
+        }
+      }
+      else {
+        // Delete file
+        n = remove(file);
+        if (n != 0) {
+          error("ERROR in remove");
+        } else {
+          printf("Deleted %s\n", file);
+        }
+        sprintf(buf, "END");
+        // Send confirmation to the client
+        n = sendto(sockfd, buf, strlen(buf), 0, (struct sockaddr *) &clientaddr, clientlen);
+        if (n < 0) {
+          error("ERROR in sendto");
+        }
+      }
+    }
+    // ls - search all the files in its local directory and send a list of all these files to the client
+    else if (!strncmp(uinput, "ls", 2)) {
+      printf("Sending file list to client");
+      // Use dirent library functionality
+      // prepare the buffer to be filled
+      bzero(buf, BUFSIZE);
+      DIR* directory = opendir(".");
+      struct dirent* dirent = readdir(directory);
+      int flag = 0;
+      // Loop through all file names and send each in a packet to the client
+      while (dirent != NULL){
+        sprintf(buf, "%s", dirent->d_name);
+        n = sendto(sockfd, buf, strlen(buf), 0, (struct sockaddr *) &clientaddr, clientlen);
+        if (n < 0) error("ERROR in sendto");
+        dirent = readdir(directory);
+        bzero(buf, BUFSIZE);
+      }
+      // send END packet to notify client all file names have been sent
+      sprintf(buf, "END");
+      n = sendto(sockfd, buf, strlen(buf), 0, (struct sockaddr *) &clientaddr, clientlen);
+    }
+    // exit - The server should exit gracefully
+    else if (!strncmp(uinput, "exit", 4)) {
+      bzero(buf, BUFSIZE);
+      sprintf(buf, "Exiting gracefully");
+      // Send exit message to client
+      n = sendto(sockfd, buf, strlen(buf), 0, (struct sockaddr *) &clientaddr, clientlen);
+      if (n < 0) error("ERROR in sendto");
+      return 0;
+    }
+    // all other inputs - y repeat the command back to the client with no modification
+    // stating that the given command was not understood
+    else {
+      bzero(buf, BUFSIZE);
+      printf("Message %s was not understood", uinput);
+      // Send error response to client
+      sprintf(buf, "ERR");
+      n = sendto(sockfd, buf, strlen(buf), 0, (struct sockaddr *) &clientaddr, clientlen);
+      if (n < 0) {
+        error("ERROR in sendto");
+      }
+    }
+  }
+}
